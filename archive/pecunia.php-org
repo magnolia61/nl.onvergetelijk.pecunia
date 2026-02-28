@@ -1,0 +1,514 @@
+<?php
+
+#error_reporting(E_ALL);
+#ini_set('display_errors', true);
+#ini_set('display_startup_errors', true);
+
+require_once 'pecunia.civix.php';
+
+/**
+ * Implements hook_civicrm_pre().
+ *
+ * @link http://wiki.civicrm.org/confluence/display/CRMDOC/hook_civicrm_pre
+ */
+function pecunia_civicrm_pre($op, $objectName, $id, &$params) {
+
+    $extdebug = 1;  // 1 = basic // 2 = verbose // 3 = params / 4 = results
+
+    if ($objectName === 'Contribution') {
+
+        wachthond($extdebug,4, "###########################################################", "");
+        wachthond($extdebug,4, 'PECUNIA pre - objectName',              $objectName);
+        wachthond($extdebug,4, 'PECUNIA pre - op',                      $op);
+        wachthond($extdebug,4, 'PECUNIA pre - contrib_id',              $id);
+        wachthond($extdebug,4, 'PECUNIA pre - params',                  $params);
+        wachthond($extdebug,4, "###########################################################", "");
+
+    }
+
+    if ($op === 'create' OR $op === 'edit') {
+
+        if ($objectName === 'LineItem') {
+            if ($params AND in_array($params['financial_type_id'], array(1,4,14,15,22))) {
+                $lcid = $params['contribution_id'];
+                wachthond($extdebug,3, "###########################################################", "");
+                wachthond($extdebug,3, "PECUNIA - FOUND LINEITEM CONTRIBUTION ID", $lcid);
+                wachthond($extdebug,3, "###########################################################", "");
+            }
+        }
+        if ($objectName === 'Contribution') {
+            if ( $params AND in_array($params['financial_type_id'], array(1,4,14,15,22)) ) {
+                $ccid = $id;
+                wachthond($extdebug,3, "###########################################################", "");
+                wachthond($extdebug,3, "PECUNIA - FOUND CONTRIB CONTRIBUTION ID", $ccid);
+                wachthond($extdebug,3, "###########################################################", "");
+            }
+        }
+    }
+
+    if ($objectName === 'Contribution'  && in_array($params['financial_type_id'], array(1,4,14,15,22))) {
+
+        wachthond($extdebug,1, "#########################################################################");
+        wachthond($extdebug,1, "### START EXTENSION PECUNIA", "[type: $objectName] [contrib_id: $id]");
+        wachthond($extdebug,1, "#########################################################################");
+
+        if ($params['financial_type_id']) {
+            $financial_type = $params['financial_type_id'];
+            wachthond($extdebug,3, 'financial_type_id', $financial_type);
+        }
+
+        ######################################################################################################################
+        # BIJ PRE-CREATE CONTRIBUTION IS ER NOG GEEN CONTRIB ID EN IS DE QUERY DUS NOG LEEG
+        ######################################################################################################################
+
+        if ($op === 'create') {
+
+            wachthond($extdebug,1, "#########################################################################");
+            wachthond($extdebug,1, "### 1.1 VERANDER BIJ 'CREATE' DECLARATIEBEDRAG NAAR EEN NEGATIEVE WAARDE");
+            wachthond($extdebug,1, "#########################################################################");
+
+            if ($params['financial_type_id'] == 22) {
+
+                $params['contribution_status_id'] = 9; // EEN NIEUWE DECLARATIE HEEFT STATUS 'PENDING REFUND' BY DEFAULT
+
+                // M61: TODO: VEEL BETER OM ECHT EEN NIEUWE JUISTE LINE-ITEM EN FIN TRNX AAN TE MAKEN IPV ALLEEN WAARDE NEGATIEF
+                if ($params['net_amount'] > 0) {
+                    $params['net_amount'] = $params['net_amount'] * -1;
+
+                    wachthond($extdebug,1, "CHANGED   NET AMOUNT VALUE TO NEGATIVE BECAUSE IT WAS NOT", $params['net_amount']);
+                }
+                if ($params['total_amount'] > 0) {
+                    $params['total_amount'] = $params['total_amount'] * -1; 
+
+                    wachthond($extdebug,1, "CHANGED TOTAL AMOUNT VALUE TO NEGATIVE BECAUSE IT WAS NOT", $params['total_amount']);
+                }
+            }
+        }
+
+        ##########################################################################################################################
+        # ALS ER WEL EEN CONTRIB ID IS DAN IS HET DUS PER DEFINITIE EEN 'EDIT' EN GEEN 'CREATE' - DEZE HELE SECTIE KAN OOK VERHUIZEN NAAR POST SAVE
+        ##########################################################################################################################
+
+        if ($op === 'edit') {
+
+            wachthond($extdebug,1, "#########################################################################");
+            wachthond($extdebug,1, "### 1.1 HAAL IGV 'EDIT' EERST DE RELEVANTE DATA VAN DEZE CONTRIBUTION OP");
+            wachthond($extdebug,1, "#########################################################################");
+
+            if (!$financial_type) {
+                wachthond($extdebug,4, 'PECUNIA financial_type mist!', $params);
+            }
+
+            $params_saldo_get = [
+                'checkPermissions' => FALSE,
+                'debug'   => FALSE,
+                'select'  => [
+                    'contact_id',
+                    'contact_id.display_name',
+                    'contribution_status_id',
+                    'contribution_status_id:label',
+                    'financial_type_id',
+                    'paid_amount',
+                    'balance_amount',
+                    'total_amount',
+                    'net_amount',
+                    'CONT_KAMPGELD.bedrag',
+                    'CONT_KAMPGELD.betaald',
+                    'CONT_KAMPGELD.saldo',
+                ],
+                'where' => [
+                    ['id', '=', $id],
+                ],
+            ];
+            if ($id AND $id > 0)        {
+                wachthond($extdebug,3, 'PECUNIA params_saldo_get',          $params_saldo_get);
+                $result_saldo_get   = civicrm_api4('Contribution', 'get',   $params_saldo_get);
+                wachthond($extdebug,4, 'PECUNIA result_saldo_get',          $result_saldo_get);
+                $result_saldo_get_count  = $result_saldo_get->count();
+            } else {
+                wachthond($extdebug,1, "ER IS GEEN CONTRIB ID DUS WE SKIPPEN DE QUERY CONTRIBUTION GET");
+                $result_saldo_get_count = NULL;
+            }
+
+            $bedrag         = 0;
+            $betaald        = 0;
+            $balans         = 0;
+
+            $contact_id     = $result_saldo_get[0]['contact_id'];
+            $display_name   = $result_saldo_get[0]['contact_id.display_name'];
+            $financial_type = $result_saldo_get[0]['financial_type_id'];
+            $saldo_paid     = $result_saldo_get[0]['paid_amount'];
+            $saldo_balance  = $result_saldo_get[0]['balance_amount'];
+            $amount_total   = $result_saldo_get[0]['total_amount'];
+            $amount_net     = $result_saldo_get[0]['net_amount'];
+            $bedrag         = $result_saldo_get[0]['CONT_KAMPGELD.bedrag'];
+            $betaald        = $result_saldo_get[0]['CONT_KAMPGELD.betaald'];
+            $balans         = $result_saldo_get[0]['CONT_KAMPGELD.saldo'];
+            $status         = $result_saldo_get[0]['contribution_status_id:label'];
+            $status_id      = $result_saldo_get[0]['contribution_status_id'];
+
+            wachthond($extdebug,2, "display_name",      $display_name);
+            wachthond($extdebug,2, "contact_id",        $contact_id);
+
+            wachthond($extdebug,2, "contribution_id",   $id);
+            wachthond($extdebug,2, "financial_type",    $financial_type);
+
+            wachthond($extdebug,2, "amount_total",      $amount_total);
+            wachthond($extdebug,2, "amount_net",        $amount_net);
+
+            wachthond($extdebug,2, "saldo_paid",        $saldo_paid);
+            wachthond($extdebug,2, "saldo_balance",     $saldo_balance);
+
+            wachthond($extdebug,2, "bedrag",            $bedrag);
+            wachthond($extdebug,2, "betaald",           $betaald);
+            wachthond($extdebug,2, "balans",            $balans);
+
+            wachthond($extdebug,2, "status",            $status);
+            wachthond($extdebug,2, "status_id",         $status_id);
+
+            if (!in_array($financial_type, array(1,4,14,15,22))) {
+
+                wachthond($extdebug,1, "financial_type ($financial_type) niet 1,4,14,15,22", "[DUS EXIT PECUNIA]");
+                return; //  if not, get out of here
+
+            }
+
+            wachthond($extdebug,1, "#########################################################################");
+            wachthond($extdebug,1, "### 1.2 BEREKEN BETAALD & SALDO VAN CONTRIBUTIONS - START             ###");
+            wachthond($extdebug,1, "#########################################################################");
+
+            $bedrag         = $amount_net;
+            $betaald        = $saldo_paid;
+            $balans         = $saldo_balance;
+
+            $params_saldo_update = [
+                'checkPermissions' => FALSE,
+                'where' => [
+                    ['id', '=', $id],
+                ],
+                'values' => [
+                    'CONT_KAMPGELD.bedrag'  => $bedrag,
+                    'CONT_KAMPGELD.betaald' => $betaald,
+                    'CONT_KAMPGELD.saldo'   => $balans,
+                ],
+            ];
+
+            $nieuwbedrag    = $bedrag;
+            $nieuwbetaald   = $betaald;
+            $nieuwbalans    = $balans;
+
+            if ($params['financial_type_id'] == 22) {
+
+                // M61: TODO: VEEL BETER OM ECHT EEN NIEUWE JUISTE LINE-ITEM AN FIN TRNX AAN TE MAKEN IPV ALLEEN WAARDE NEGATIEF
+                if ($params['net_amount'] > 0) {
+                    $params['net_amount'] = $params['net_amount'] * -1;
+                    $params_saldo_update['values']['net_amount'] = $params['net_amount'];
+                    wachthond($extdebug,1, 'CHANGED   NET AMOUNT VALUE TO NEGATIVE BECAUSE IT WAS NOT', $params['net_amount']);
+                }
+                if ($params['total_amount'] > 0) {
+                    $params['total_amount'] = $params['total_amount'] * -1;
+                    $params_saldo_update['values']['total_amount'] = $params['total_amount'];
+                    wachthond($extdebug,1, 'CHANGED TOTAL AMOUNT VALUE TO NEGATIVE BECAUSE IT WAS NOT', $params['total_amount']);
+                }
+
+                if ($bedrag > 0) {
+                    $nieuwbedrag = $bedrag * -1;
+                    wachthond($extdebug,1, 'CHANGED BEDRAG VALUE TO NEGATIVE BECAUSE IT WAS NOT', "[nieuwbedrag: $nieuwbedrag]");
+                }
+
+                // (bedrag plus betaald in dit geval want nieuwbedrag is een declaratie en is < 0 )
+                $nieuwbalans  = $nieuwbedrag + $betaald;
+
+                if ($nieuwbalans  < 0 AND !in_array($status_id, array("7")))   {   // DO NOT CHANGE STATUS WHEN IT IS 'COMPLETE' OR 'REFUNDED'
+                    $nieuwstatus_id =  9;
+                    $params['contribution_status_id'] = 9;  // PENDING REFUND
+                    $params_saldo_update['values']['contribution_status_id'] = $nieuwstatus_id;
+                    wachthond($extdebug,1, "CHANGED STATUS TO PENDING REFUND BECAUSE IT WAS NOT", "[nieuwsbalans: $nieuwbalans]");
+                }
+                if ($nieuwbalans == 0 AND !in_array($status_id, array("7")))   {   // DO NOT CHANGE STATUS WHEN IT IS 'COMPLETE' OR 'REFUNDED'
+                    $nieuwstatus_id =  7;
+                    $params['contribution_status_id'] = 7;  // REFUNDED
+                    $params_saldo_update['values']['contribution_status_id'] = $nieuwstatus_id;
+                    wachthond($extdebug,1, "CHANGED STATUS TO 'TERUGBETAALD' OMDAT BALANS 0 IS", "[nieuwsbalans: $nieuwbalans]");
+                }
+            }
+/*
+            if ($betaald   > $bedrag) {
+                $nieuwbedrag = $betaald;
+            } else {
+                $nieuwbedrag = $bedrag;
+            }
+*/
+
+            wachthond($extdebug,1, "nieuwbedrag",   $nieuwbedrag);
+            wachthond($extdebug,1, "nieuwbetaald",  $nieuwbetaald);
+            wachthond($extdebug,1, "nieuwbalans",   $nieuwbalans);
+
+            $params_saldo_update['values']['CONT_KAMPGELD.bedrag']  = $nieuwbedrag;
+            $params_saldo_update['values']['CONT_KAMPGELD.betaald'] = $nieuwbetaald;
+            $params_saldo_update['values']['CONT_KAMPGELD.saldo']   = $nieuwbalans;
+
+            wachthond($extdebug,1, "#########################################################################");
+            wachthond($extdebug,1, "### 1.3 BEKIJK OF ADHV REFUNDS DE STATUS MOET WORDEN GECORRIGEERD     ###");
+            wachthond($extdebug,1, "#########################################################################");
+/*
+            $params_refunds_get = [
+                'checkPermissions' => FALSE,
+                'debug'   => FALSE,
+                'select' => [
+                    'id',
+                    'trxn_date',
+                    'total_amount',
+                    'contribution.id',
+                ],
+                'join' => [
+                    ['Contribution AS contribution', 'LEFT', 'EntityFinancialTrxn'],
+                ],
+                'where' => [
+                    ['status_id',       '=', 7],
+                    ['contribution.id', '=', $id],
+                ],
+            ];
+
+//          $result_refunds_get = civicrm_api4('FinancialTrxn', 'get', $params_refunds_get);
+
+*/
+            $params_trxn_total_get = [
+                'checkPermissions' => FALSE,
+                'debug'   => FALSE,
+                'select' => [
+                    'contact_id',
+                    'trxn_id',
+                    'financial_trxn.total_amount',
+                    'financial_trxn.trxn_date',
+                ],
+                'join' => [
+                    ['FinancialTrxn AS financial_trxn', 'LEFT', 'EntityFinancialTrxn'],
+                ],
+                'where' => [
+                    ['financial_trxn.status_id',    '!=', 7],
+                    ['id',                          '=', $id],
+                ],
+            ];
+
+            wachthond($extdebug,3, "params_trxn_total_get",                 $params_trxn_total_get);
+            $result_trxn_total_get = civicrm_api4('Contribution', 'get',    $params_trxn_total_get);
+            wachthond($extdebug,4, "result_trxn_total_get",                 $result_trxn_total_get);
+
+            $params_trxn_refunds_get = [
+                'checkPermissions' => FALSE,
+                'debug'   => FALSE,
+                'select' => [
+                    'contact_id',
+                    'trxn_id',
+                    'financial_trxn.total_amount',
+                    'financial_trxn.trxn_date',
+                ],
+                'join' => [
+                    ['FinancialTrxn AS financial_trxn', 'LEFT', 'EntityFinancialTrxn'],
+                ],
+                'where' => [
+                    ['financial_trxn.status_id',    '=', 7],
+                    ['id',                          '=', $id],
+                ],
+            ];
+
+            wachthond($extdebug,3, "params_trxn_refunds_get",               $params_trxn_refunds_get);
+            $result_trxn_refunds_get = civicrm_api4('Contribution', 'get',  $params_trxn_refunds_get);
+            wachthond($extdebug,4, "result_trxn_refunds_get",               $result_trxn_refunds_get);
+
+            $trxn_total     = $result_trxn_total_get[0]['financial_trxn.total_amount'];
+            $trxn_refunded  = $result_trxn_refunds_get[0]['financial_trxn.total_amount'];
+
+            wachthond($extdebug,1, "Totaal betaald : trxn_total",           $trxn_total);
+            wachthond($extdebug,1, "Totaal refunded: trxn_refunded",        $trxn_refunded);
+/*
+            $refunded_saldo = $trxn_refunded + $nieuwbedrag;
+            if ($extdebug >= 3) { watchdog('php','<pre>refunded_saldo           : '.print_r($refunded_saldo,TRUE).'</pre>',NULL, WATCHDOG_DEBUG);   }
+
+            if ($refunded_saldo == 0 AND $balans == 0 AND $betaald == 0 AND $saldo_balance == 0) {
+                $nieuwstatus    = 'Terugbetaald';
+                $nieuwstatus_id = 7;
+                if ($nieuwstatus) {
+                    $params_saldo_update['values']['contribution_status_id:label']  = $nieuwstatus;
+                    $params_saldo_update['values']['contribution_status_id']        = $nieuwstatus_id;
+                }
+                if ($extdebug >= 3) { watchdog('php','<pre>Change Contribution Status to: Refunded</pre>',NULL,WATCHDOG_DEBUG);  }
+            } else {
+                $nieuwstatus = $status;
+            }
+*/
+            if ($objectName === 'Contribution' && !empty($params['contribution_status_id']) && $params['financial_type_id'] == 22) {;
+
+                wachthond($extdebug,4, 'op',                     $op);
+                wachthond($extdebug,4, 'objectId',               $objectId);
+                wachthond($extdebug,4, 'objectName',             $objectName);
+                wachthond($extdebug,4, 'objectRef',              $objectRef);
+
+                wachthond($extdebug,4, 'contribution id',        $id);
+                wachthond($extdebug,4, 'params',                 $params);
+
+                wachthond($extdebug,4, 'contrib fintype',        $objectRef->financial_type_id);
+                wachthond($extdebug,4, 'contrib_status',         $objectRef->contribution_status_id);
+
+                $params['custom_576_775'] = str_replace(' ', '', $params['custom_576_775']);
+
+                wachthond($extdebug,4, 'iban nummer',            $params['custom_576_775']);
+
+                wachthond($extdebug,4, 'total_amount',           $total_amount);
+                wachthond($extdebug,4, 'net_amount',             $net_amount);
+
+            }
+
+            wachthond($extdebug,1, "#########################################################################");
+            wachthond($extdebug,1, "### 2.0 DOE DE UITEINDELIJKE API UPDATE VAN DEZE CONTRIBUTION         ###");
+            wachthond($extdebug,1, "#########################################################################");
+
+            wachthond($extdebug,3, "params_saldo_update",                     $params_saldo_update);
+            if ($id AND $id > 0) {
+                $result_saldo_update = civicrm_api4('Contribution', 'update', $params_saldo_update);
+                wachthond($extdebug,1, "params_saldo_update", "EXECUTED");
+            } else {
+                wachthond($extdebug,1, "params_saldo_update", "SKIPPED");
+            }
+            wachthond($extdebug,4, "result_saldo_update",                     $result_saldo_update);
+
+            wachthond($extdebug,1, "#########################################################################");
+            wachthond($extdebug,1, "### EINDE EXTENSION PECUNIA [$display_name]","[bid: $id] [op: $op]");
+            wachthond($extdebug,1, "#########################################################################");
+        }
+    }
+}
+
+function pecunia_civicrm_post($op, $objectName, $objectId, &$objectRef) {
+
+  if ($op === 'create' OR $op === 'edit') {
+
+    if ($objectName === 'QContribution' && in_array($objectRef->financial_type_id, array(1,4,14,15,22))) {
+
+        wachthond($extdebug,1, "#########################################################################");
+        wachthond($extdebug,1, "### PECUNIA POST - BEREKEN BETAALD & SALDO VAN CONTRIBUTIONS - START  ###");
+        wachthond($extdebug,1, "#########################################################################");
+
+        wachthond($extdebug,4, 'PECUNIA post - op',          			$op);
+        wachthond($extdebug,4, 'PECUNIA post - objectId',               	$objectId);
+        wachthond($extdebug,4, 'PECUNIA post - objectName',             	$objectName);
+        wachthond($extdebug,4, 'PECUNIA post - objectRef',              	$objectRef);
+
+        wachthond($extdebug,4, 'PECUNIA post - contribution id',        	$id);
+        wachthond($extdebug,4, 'PECUNIA post - params',				$params);
+
+        wachthond($extdebug,4, 'PECUNIA post - objectRef - fintype',        	$objectRef->financial_type_id);
+        wachthond($extdebug,4, 'PECUNIA post - objectRef - contrib_status', 	$objectRef->contribution_status_id);
+
+        $params_saldo_get = [
+            'checkPermissions' => FALSE,
+            'debug'   => FALSE,
+            'select'  => [
+                'paid_amount',
+                'balance_amount',
+                'total_amount',
+                'net_amount',
+            ],
+            'where' => [
+                ['id', '=', $objectId],
+            ],
+        ];
+        watchdog('php','<pre>params_saldo_get        : '.print_r($params_saldo_get,TRUE).'</pre>',NULL, WATCHDOG_DEBUG);
+        $result_saldo_get   = civicrm_api4('Contribution', 'get', $params_saldo_get);
+        watchdog('php','<pre>result_saldo_get        : '.print_r($result_saldo_get,TRUE).'</pre>',NULL, WATCHDOG_DEBUG);
+
+        $saldo_paid     = $result_saldo_get[0]['balance_amount'];
+        $saldo_balance  = $result_saldo_get[0]['paid_amount'];
+        $saldo_total    = $result_saldo_get[0]['total_amount'];
+        $saldo_net      = $result_saldo_get[0]['net_amount'];
+
+	    wachthond($extdebug,2, "saldo_paid",        $saldo_paid);
+	    wachthond($extdebug,2, "saldo_balance",     $saldo_balance);
+	    wachthond($extdebug,2, "saldo_total",     	$saldo_total);
+	    wachthond($extdebug,2, "saldo_net", 	$saldo_net);
+
+        $params_saldo_update = [
+            'checkPermissions' => FALSE,
+            'where' => [
+                ['id',  '=', $objectId],
+            ],
+            'values' => [
+                'CONT_KAMPGELD.betaald' => $saldo_paid,
+                'CONT_KAMPGELD.saldo'   => $saldo_balance,
+                'CONT_KAMPGELD.bedrag'  => $saldo_net,
+            ],
+        ];
+
+        wachthond($extdebug,7, "params_saldo_update",	$params_saldo_update);
+        if ($objectId) {
+            $result_saldo_update   = civicrm_api4('Contribution', 'update', $params_saldo_update);
+	    wachthond($extdebug,3, "params_saldo_update",	"EXECUTED");
+        }
+        wachthond($extdebug,9, "result_saldo_update",	$result_saldo_update);
+    	wachthond($extdebug,3, "### BEREKEN BETAALD & SALDO VAN CONTRIBUTIONS", "[EINDE]");
+    }
+  }
+}
+
+/**
+ * Implementation of hook_civicrm_config
+ */
+function pecunia_civicrm_config(&$config) {
+  _pecunia_civix_civicrm_config($config);
+}
+
+/**
+ * Implementation of hook_civicrm_xmlMenu
+ *
+ * @param $files array(string)
+ */
+
+/*
+function pecunia_civicrm_xmlMenu(&$files) {
+  _pecunia_civix_civicrm_xmlMenu($files);
+}
+*/
+
+/**
+ * Implementation of hook_civicrm_install
+ */
+function pecunia_civicrm_install() {
+  #CRM_Utils_File::sourceSQLFile(CIVICRM_DSN, __DIR__ . '/sql/auto_install.sql');
+  return _pecunia_civix_civicrm_install();
+}
+
+/**
+ * Implementation of hook_civicrm_uninstall
+ */
+function pecunia_civicrm_uninstall() {
+  #CRM_Utils_File::sourceSQLFile(CIVICRM_DSN, __DIR__ . '/sql/auto_uninstall.sql');
+  return _pecunia_civix_civicrm_uninstall();
+}
+
+/**
+ * Implementation of hook_civicrm_enable
+ */
+function pecunia_civicrm_enable() {
+  return _pecunia_civix_civicrm_enable();
+}
+
+/**
+ * Implementation of hook_civicrm_disable
+ */
+function pecunia_civicrm_disable() {
+  return _pecunia_civix_civicrm_disable();
+}
+
+/**
+ * Implementation of hook_civicrm_managed
+ *
+ * Generate a list of entities to create/deactivate/delete when this module
+ * is installed, disabled, uninstalled.
+ */
+
+/*
+function pecunia_civicrm_managed(&$entities) {
+  return _pecunia_civix_civicrm_managed($entities);
+}
+*/
